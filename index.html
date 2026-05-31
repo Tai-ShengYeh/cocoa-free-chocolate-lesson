@@ -6,6 +6,8 @@
 <title>無可可巧克力革命 — 華文文獻閱讀與寫作</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<!-- Supabase JS（即時投票同步＋記錄；anon insert-only 公開金鑰，無 Google 金鑰）-->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 html, body {
   margin: 0; padding: 0;
@@ -1137,9 +1139,13 @@ async function logInteraction(eventType, data){
   }catch(e){ console.warn('Supabase log failed:', e); }
 }
 
-// Firebase 已移除（不在公開網站暴露金鑰）
-let fbDb=null, FB_OK=false;
-function initFirebase(){ /* Firebase 停用：投票改走單機計票 + Supabase 記錄 */ }
+// ─── Supabase Realtime（即時投票同步，無 Google 金鑰）────
+let sb=null, RT_OK=false;
+function initRealtime(){
+  if(!SUPA_READY || typeof supabase==='undefined') return;
+  try{ sb=supabase.createClient(SUPABASE_URL, SUPABASE_ANON); RT_OK=true; }
+  catch(e){ console.warn('Supabase client init failed:', e); }
+}
 
 // ─── 名字輸入閘門 ─────────────────────────────────────
 function showGateIfNeeded(){
@@ -1157,7 +1163,7 @@ function enterName(){
   logInteraction('join', {});
 }
 
-// ─── POLL（Firebase 即時 ／ 無金鑰時單機）─────────────
+// ─── POLL（Supabase Realtime 即時同步 ／ 連不上時單機）──
 const POLL_LABELS = ['每週都吃','偶爾吃','很少吃','不確定怎麼做'];
 const pv = [0,0,0,0];
 let myVote = localStorage.getItem('cocoa_vote_'+SESSION_KEY);
@@ -1174,24 +1180,31 @@ function renderPollBars(counts){
     o.classList.toggle('active', myVote===j);
   });
 }
-function subscribePoll(){
-  if(!FB_OK) return;
-  fbDb.collection('live_poll').doc(SESSION_KEY).onSnapshot(doc=>{
-    const d=doc.data()||{};
-    renderPollBars([d.opt0||0, d.opt1||0, d.opt2||0, d.opt3||0]);
-  }, e=>console.warn('poll snapshot:', e));
+async function subscribePoll(){
+  if(!RT_OK) return;
+  // 先抓目前票數（讓晚進來的同學也看到累積結果）
+  try{
+    const { data } = await sb.from('poll_counts').select('opt0,opt1,opt2,opt3').eq('session_key', SESSION_KEY).maybeSingle();
+    if(data) renderPollBars([data.opt0||0, data.opt1||0, data.opt2||0, data.opt3||0]);
+  }catch(e){ console.warn('poll initial:', e); }
+  // 訂閱即時變化 → 全班手機同步
+  sb.channel('poll_'+SESSION_KEY)
+    .on('postgres_changes',
+        { event:'*', schema:'public', table:'poll_counts', filter:'session_key=eq.'+SESSION_KEY },
+        payload=>{ const r=payload.new||{}; renderPollBars([r.opt0||0, r.opt1||0, r.opt2||0, r.opt3||0]); })
+    .subscribe();
 }
 function vote(i){
-  if(FB_OK){
-    if(myVote===i) return;
-    const ref=fbDb.collection('live_poll').doc(SESSION_KEY);
-    const inc=firebase.firestore.FieldValue.increment;
-    const upd={}; if(myVote!==null) upd['opt'+myVote]=inc(-1); upd['opt'+i]=inc(1);
-    myVote=i; localStorage.setItem('cocoa_vote_'+SESSION_KEY, i);
-    ref.set(upd,{merge:true}).catch(e=>console.warn('vote:', e));
+  const prev=myVote;
+  if(prev===i) return;                          // 已投同一個就不重複
+  myVote=i; localStorage.setItem('cocoa_vote_'+SESSION_KEY, i);
+  if(RT_OK){
+    sb.rpc('poll_vote', { p_session:SESSION_KEY, p_old:(prev==null?-1:prev), p_new:i })
+      .then(({error})=>{ if(error) console.warn('vote rpc:', error); });
+    document.querySelectorAll('.poll-opt').forEach((o,j)=>o.classList.toggle('active', j===i));
   }else{
-    if(myVote!==null && pv[myVote]>0) pv[myVote]--;
-    pv[i]++; myVote=i; renderPollBars(pv);
+    if(prev!=null && pv[prev]>0) pv[prev]--;
+    pv[i]++; renderPollBars(pv);
   }
   logInteraction('poll', {choice:i, label:POLL_LABELS[i]});
 }
@@ -1385,7 +1398,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   initTF();
   initDrag();
   updateFillCurrent();
-  initFirebase();
+  initRealtime();
   subscribePoll();
   showGateIfNeeded();
   const gi=document.getElementById('gate-input');
